@@ -25,7 +25,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-from . import engine, matching
+from . import engine, matching, solution
 from .database import connect
 
 # SQLite 单文件写入需要串行化；批量提交 + 重算整体持锁。
@@ -1344,6 +1344,58 @@ def alert_custody(conn: sqlite3.Connection, sample_id: str) -> list[dict]:
                 }
             )
     return items
+
+
+# ---------------- 只读配液方案 ----------------
+
+
+def plan_solution(conn: sqlite3.Connection, data: dict) -> Optional[dict]:
+    """只读计算配液方案：关联已有样本校验，不读取也不扣减任何库存。
+
+    来源浓度与可用体积均取自请求（调用方已做范围校验），
+    本层只负责确认每个样本 ID 都存在；重复 ID / 非法参数由 Pydantic 拦截。
+    存在精确方案时返回含零用量逐项配方的响应字典；无精确解返回 ``None``。
+    """
+
+    source_rows = data["sources"]
+    for item in source_rows:
+        if get_sample(conn, item["sample_id"]) is None:
+            raise ValidationError(f"样本 {item['sample_id']} 不存在")
+
+    sources = [
+        solution.SolutionSource(
+            concentration_ng_ul=item["concentration_ng_ul"],
+            available_volume_ul=item["available_volume_ul"],
+        )
+        for item in source_rows
+    ]
+    volumes = solution.solve_plan(
+        sources,
+        target_volume_ul=data["target_volume_ul"],
+        target_concentration_ng_ul=data["target_concentration_ng_ul"],
+    )
+    if volumes is None:
+        return None
+
+    target_volume = data["target_volume_ul"]
+    target_concentration = data["target_concentration_ng_ul"]
+    items = [
+        {
+            "sample_id": item["sample_id"],
+            "concentration_ng_ul": item["concentration_ng_ul"],
+            "available_volume_ul": item["available_volume_ul"],
+            "volume_ul": volume,
+        }
+        for item, volume in zip(source_rows, volumes)
+    ]
+    return {
+        "target_volume_ul": target_volume,
+        "target_concentration_ng_ul": target_concentration,
+        "used_sample_count": sum(1 for v in volumes if v > 0),
+        "total_volume_ul": sum(volumes),
+        "total_mass_ng": sum(v * c for v, c in zip(volumes, (s.concentration_ng_ul for s in sources))),
+        "items": items,
+    }
 
 
 def get_db_connection() -> sqlite3.Connection:

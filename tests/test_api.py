@@ -1572,3 +1572,201 @@ def test_invalid_period_is_per_logger_and_cascades(client) -> None:
     assert client.get("/loggers/lg1/invalid-periods").json() == []
     # lg2 的归属不受影响
     assert [x["event_id"] for x in client.get("/samples/s1/readings?source=logger").json()] == ["b1"]
+
+
+# ---------------- 只读配液方案 ----------------
+
+
+def _make_samples_for_plan(client, ids):
+    for sid in ids:
+        _create_sample(client, sid)
+
+
+def _plan_payload(ids, concs, caps, target_volume, target_conc):
+    return {
+        "sources": [
+            {"sample_id": sid, "concentration_ng_ul": c, "available_volume_ul": u}
+            for sid, c, u in zip(ids, concs, caps)
+        ],
+        "target_volume_ul": target_volume,
+        "target_concentration_ng_ul": target_conc,
+    }
+
+
+def test_solution_plan_basic_single_source(client) -> None:
+    _make_samples_for_plan(client, ["a", "b", "c"])
+    payload = _plan_payload(
+        ["a", "b", "c"], [0, 50, 100], [10, 10, 10], 10, 50
+    )
+    r = client.post("/solution-plans", json=payload)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["target_volume_ul"] == 10
+    assert body["target_concentration_ng_ul"] == 50
+    assert body["used_sample_count"] == 1
+    assert body["total_volume_ul"] == 10
+    assert body["total_mass_ng"] == 500
+    # 含零用量逐项配方，顺序与请求一致
+    assert [it["sample_id"] for it in body["items"]] == ["a", "b", "c"]
+    assert [it["volume_ul"] for it in body["items"]] == [0, 10, 0]
+    for it in body["items"]:
+        assert set(it) == {
+            "sample_id",
+            "concentration_ng_ul",
+            "available_volume_ul",
+            "volume_ul",
+        }
+        assert 0 <= it["volume_ul"] <= it["available_volume_ul"]
+
+
+def test_solution_plan_min_source_then_lex_order(client) -> None:
+    _make_samples_for_plan(client, ["a", "b", "c"])
+    # 50 浓度来源容量仅 6；0/100 两源配平需 100 源 5 µL，容量充足 ->
+    # 两来源 [5, 0, 5]（不使用 50 源）
+    payload = _plan_payload(["a", "b", "c"], [0, 50, 100], [30, 6, 30], 10, 50)
+    r = client.post("/solution-plans", json=payload)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert [it["volume_ul"] for it in body["items"]] == [5, 0, 5]
+    assert body["used_sample_count"] == 2
+    assert body["total_mass_ng"] == 500
+
+    # 100 源容量仅 4，两来源配平不可行；强制三来源，字典序最小 [2, 6, 2]
+    payload = _plan_payload(["a", "b", "c"], [0, 50, 100], [30, 6, 4], 10, 50)
+    r = client.post("/solution-plans", json=payload)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert [it["volume_ul"] for it in body["items"]] == [2, 6, 2]
+    assert body["used_sample_count"] == 3
+    assert body["total_mass_ng"] == 500
+
+
+def test_solution_plan_zero_volume_entries_returned(client) -> None:
+    _make_samples_for_plan(client, ["s1", "s2", "s3", "s4", "s5", "s6"])
+    payload = _plan_payload(
+        ["s1", "s2", "s3", "s4", "s5", "s6"],
+        [10, 20, 30, 40, 60, 50],
+        [30, 30, 30, 30, 30, 30],
+        30,
+        50,
+    )
+    r = client.post("/solution-plans", json=payload)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    volumes = [it["volume_ul"] for it in body["items"]]
+    assert volumes == [0, 0, 0, 0, 0, 30]
+    assert body["used_sample_count"] == 1
+    assert len(body["items"]) == 6
+
+
+def test_solution_plan_no_exact_solution_409(client) -> None:
+    _make_samples_for_plan(client, ["a", "b"])
+    # 目标浓度 49 无法由 0/100 整数配出（需 4.9 µL 的 100）
+    payload = _plan_payload(["a", "b"], [0, 100], [10, 10], 10, 49)
+    r = client.post("/solution-plans", json=payload)
+    assert r.status_code == 409
+    # 低于最低浓度 / 高于最高浓度同样无解
+    assert client.post(
+        "/solution-plans",
+        json=_plan_payload(["a", "b"], [20, 30], [10, 10], 5, 10),
+    ).status_code == 409
+    assert client.post(
+        "/solution-plans",
+        json=_plan_payload(["a", "b"], [20, 80], [10, 10], 5, 90),
+    ).status_code == 409
+
+
+def test_solution_plan_nonexistent_sample_422(client) -> None:
+    _make_samples_for_plan(client, ["a"])
+    payload = _plan_payload(["a", "ghost"], [50, 50], [5, 5], 1, 50)
+    r = client.post("/solution-plans", json=payload)
+    assert r.status_code == 422
+    assert "不存在" in r.json()["detail"]
+    # 全部不存在同样 422（而非 404）
+    payload = _plan_payload(["ghost"], [50], [5], 1, 50)
+    assert client.post("/solution-plans", json=payload).status_code == 422
+
+
+def test_solution_plan_duplicate_sample_id_422(client) -> None:
+    _make_samples_for_plan(client, ["a"])
+    payload = _plan_payload(["a", "a"], [10, 20], [5, 5], 1, 10)
+    r = client.post("/solution-plans", json=payload)
+    assert r.status_code == 422
+
+
+def test_solution_plan_invalid_ranges_422(client) -> None:
+    _make_samples_for_plan(client, ["a", "b", "c", "d", "e", "f", "g"])
+    base = lambda: _plan_payload(["a"], [10], [5], 1, 10)
+
+    bad_bodies = [
+        _plan_payload(["a"], [101], [5], 1, 10),       # 浓度超上限
+        _plan_payload(["a"], [-1], [5], 1, 10),        # 浓度负
+        _plan_payload(["a"], [10], [31], 1, 10),       # 可用体积超上限
+        _plan_payload(["a"], [10], [-1], 1, 10),       # 可用体积负
+        {**base(), "target_volume_ul": 0},             # 目标体积 0
+        {**base(), "target_volume_ul": 31},            # 目标体积超上限
+        {**base(), "target_concentration_ng_ul": 101}, # 目标浓度超上限
+        {**base(), "target_concentration_ng_ul": -1},  # 目标浓度负
+    ]
+    for body in bad_bodies:
+        r = client.post("/solution-plans", json=body)
+        assert r.status_code == 422, body
+
+    ids = ["a", "b", "c", "d", "e", "f", "g"]
+    too_many = _plan_payload(ids, [10] * 7, [5] * 7, 1, 10)
+    assert client.post("/solution-plans", json=too_many).status_code == 422
+    assert client.post(
+        "/solution-plans",
+        json={"sources": [], "target_volume_ul": 1, "target_concentration_ng_ul": 10},
+    ).status_code == 422
+    # 缺字段
+    assert client.post("/solution-plans", json={"sources": []}).status_code == 422
+
+
+def test_solution_plan_requires_integers_422(client) -> None:
+    _make_samples_for_plan(client, ["a"])
+    # 整数字段拒绝 1.5、1.0（浮点）、字符串数字、布尔
+    bad_values = [
+        {"sources": [{"sample_id": "a", "concentration_ng_ul": 1.5,
+                      "available_volume_ul": 5}],
+         "target_volume_ul": 1, "target_concentration_ng_ul": 10},
+        {"sources": [{"sample_id": "a", "concentration_ng_ul": 10,
+                      "available_volume_ul": 5.0}],
+         "target_volume_ul": 1, "target_concentration_ng_ul": 10},
+        {"sources": [{"sample_id": "a", "concentration_ng_ul": True,
+                      "available_volume_ul": 5}],
+         "target_volume_ul": 1, "target_concentration_ng_ul": 10},
+        {"sources": [{"sample_id": "a", "concentration_ng_ul": "10",
+                      "available_volume_ul": 5}],
+         "target_volume_ul": 1, "target_concentration_ng_ul": 10},
+        {"sources": [{"sample_id": "a", "concentration_ng_ul": 10,
+                      "available_volume_ul": 5}],
+         "target_volume_ul": 1.0, "target_concentration_ng_ul": 10},
+    ]
+    for body in bad_values:
+        assert client.post("/solution-plans", json=body).status_code == 422, body
+
+
+def test_solution_plan_is_read_only_no_stock_change(client) -> None:
+    _make_samples_for_plan(client, ["a", "b"])
+    before = client.get("/samples").json()
+    payload = _plan_payload(["a", "b"], [0, 100], [10, 10], 10, 49)
+    # 409 或 200 都不应改动样本；先取一个可行请求
+    ok = _plan_payload(["a", "b"], [0, 100], [10, 10], 10, 50)
+    assert client.post("/solution-plans", json=ok).status_code == 200
+    assert client.post("/solution-plans", json=payload).status_code == 409
+    after = client.get("/samples").json()
+    assert before == after
+    # 未新增任何读数 / 告警
+    assert client.get("/samples/a/readings").json() == []
+    assert client.get("/alerts").json() == []
+
+
+def test_solution_plan_boundary_volume_one_ul(client) -> None:
+    _make_samples_for_plan(client, ["a", "b"])
+    # 目标 1 µL @ 50：单来源 50 直接取 1 µL
+    r = client.post(
+        "/solution-plans", json=_plan_payload(["a", "b"], [50, 60], [1, 1], 1, 50)
+    )
+    assert r.status_code == 200, r.text
+    assert [it["volume_ul"] for it in r.json()["items"]] == [1, 0]

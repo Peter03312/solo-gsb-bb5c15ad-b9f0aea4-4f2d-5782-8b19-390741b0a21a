@@ -410,3 +410,79 @@ class LoggerConsistencyResponse(BaseModel):
     unmatched_logger_count: int = Field(..., description="未配对的记录仪归属读数条数")
     anomaly_count: int = Field(..., description="温差严格大于阈值的配对数")
     anomalies: list[ConsistencyPairOut]
+
+
+# ---------------- 只读配液方案 ----------------
+
+
+class SolutionSourceIn(BaseModel):
+    """配液来源：已存在样本 ID + 该样本当前浓度（ng/µL）+ 可用体积（µL）。"""
+
+    sample_id: str = Field(..., min_length=1, max_length=128)
+    concentration_ng_ul: int = Field(
+        ...,
+        strict=True,
+        ge=0,
+        le=100,
+        description="来源样本浓度（整数 ng/µL，0～100）",
+    )
+    available_volume_ul: int = Field(
+        ...,
+        strict=True,
+        ge=0,
+        le=30,
+        description="该来源本次可用体积（整数 µL，0～30）",
+    )
+
+
+class SolutionPlanRequest(BaseModel):
+    sources: list[SolutionSourceIn] = Field(
+        ..., min_length=1, max_length=6, description="1～6 个来源样本（ID 不可重复）"
+    )
+    target_volume_ul: int = Field(
+        ...,
+        strict=True,
+        ge=1,
+        le=30,
+        description="目标配液体积（整数 µL，1～30）",
+    )
+    target_concentration_ng_ul: int = Field(
+        ...,
+        strict=True,
+        ge=0,
+        le=100,
+        description="目标浓度（整数 ng/µL，0～100）",
+    )
+
+    @model_validator(mode="after")
+    def _validate_unique_sample_ids(self):
+        ids = [s.sample_id for s in self.sources]
+        if len(ids) != len(set(ids)):
+            raise ValueError("来源样本 ID 不可重复")
+        return self
+
+
+class SolutionPlanItemOut(BaseModel):
+    """逐项配方：即使取用体积为 0 也按请求顺序逐项返回。"""
+
+    sample_id: str = Field(..., description="来源样本 ID（与请求顺序一致）")
+    concentration_ng_ul: int = Field(..., description="请求中声明的该来源浓度（ng/µL）")
+    available_volume_ul: int = Field(..., description="请求中声明的可用体积（µL）")
+    volume_ul: int = Field(..., description="从该来源取用的整数微升数（可为 0）")
+
+
+class SolutionPlanResponse(BaseModel):
+    target_volume_ul: int = Field(..., description="目标配液体积（µL）")
+    target_concentration_ng_ul: int = Field(..., description="目标浓度（ng/µL）")
+    used_sample_count: int = Field(
+        ..., description="实际使用（取用体积 > 0）的来源样本数"
+    )
+    total_volume_ul: int = Field(
+        ..., description="各来源取用体积之和（等于目标体积）"
+    )
+    total_mass_ng: int = Field(
+        ..., description="各来源 取用体积×浓度 的总和（ng，等于 目标体积×目标浓度）"
+    )
+    items: list[SolutionPlanItemOut] = Field(
+        ..., description="逐项配方（含零用量项，顺序与请求 sources 一致）"
+    )

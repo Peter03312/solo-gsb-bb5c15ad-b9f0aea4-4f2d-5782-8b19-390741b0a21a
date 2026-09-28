@@ -159,3 +159,62 @@ GET {{baseUrl}}/samples/{{sampleId}}/custody-handovers
 
 ### 23. 告警归责查询（当前告警按事件时间匹配左闭右开责任区间；查询时计算，不持久化）
 GET {{baseUrl}}/samples/{{sampleId}}/alert-custody
+
+### 24. 只读配液方案：精确枚举，不扣减库存
+###    先准备 3 个已存在样本（浓度/可用体积仅在配液请求中声明）
+POST {{baseUrl}}/samples
+Content-Type: application/json
+
+{"id": "sample-mix-0", "name": "稀释液 0 ng/µL", "freeze_threshold_c": -20, "thaw_threshold_c": 0}
+
+###
+POST {{baseUrl}}/samples
+Content-Type: application/json
+
+{"id": "sample-mix-50", "name": "标准品 50 ng/µL", "freeze_threshold_c": -20, "thaw_threshold_c": 0}
+
+###
+POST {{baseUrl}}/samples
+Content-Type: application/json
+
+{"id": "sample-mix-100", "name": "母液 100 ng/µL", "freeze_threshold_c": -20, "thaw_threshold_c": 0}
+
+### 25. 求 10 µL @ 50 ng/µL：单来源直接达标（来源数最少）
+POST {{baseUrl}}/solution-plans
+Content-Type: application/json
+
+{
+  "sources": [
+    {"sample_id": "sample-mix-0",   "concentration_ng_ul": 0,   "available_volume_ul": 10},
+    {"sample_id": "sample-mix-50",  "concentration_ng_ul": 50,  "available_volume_ul": 10},
+    {"sample_id": "sample-mix-100", "concentration_ng_ul": 100, "available_volume_ul": 10}
+  ],
+  "target_volume_ul": 10,
+  "target_concentration_ng_ul": 50
+}
+
+### 26. 无精确解（49 ng/µL 无法由 0/100 整数配出）-> 409
+POST {{baseUrl}}/solution-plans
+Content-Type: application/json
+
+{
+  "sources": [
+    {"sample_id": "sample-mix-0",   "concentration_ng_ul": 0,   "available_volume_ul": 10},
+    {"sample_id": "sample-mix-100", "concentration_ng_ul": 100, "available_volume_ul": 10}
+  ],
+  "target_volume_ul": 10,
+  "target_concentration_ng_ul": 49
+}
+
+### 27. 重复来源 ID / 样本不存在 / 参数越界 -> 422
+POST {{baseUrl}}/solution-plans
+Content-Type: application/json
+
+{
+  "sources": [
+    {"sample_id": "sample-mix-0", "concentration_ng_ul": 0, "available_volume_ul": 10},
+    {"sample_id": "sample-mix-0", "concentration_ng_ul": 0, "available_volume_ul": 10}
+  ],
+  "target_volume_ul": 10,
+  "target_concentration_ng_ul": 0
+}

@@ -39,6 +39,8 @@ from .schemas import (
     SampleOut,
     SampleStateOut,
     SampleUpdate,
+    SolutionPlanRequest,
+    SolutionPlanResponse,
 )
 
 @asynccontextmanager
@@ -65,6 +67,10 @@ app = FastAPI(
         "支持样本告警保管责任归属：按生效时间登记保管人交接（允许补录，同时刻仅一条），"
         "相邻交接形成左闭右开责任区间；告警归责查询按当前告警事件时间匹配区间、"
         "查询时即时计算不持久化，补录交接或告警重算后即反映最新结果。"
+        "另提供只读配液方案求解：给定 1～6 个已存在样本的整数浓度与可用体积以及"
+        "目标体积/浓度，精确枚举满足体积与质量（浓度×体积）双等式的整数取用方案，"
+        "按使用来源样本数最少、取用体积向量字典序最小择优；只读不扣减库存，"
+        "无精确解返回 409，样本不存在、重复 ID 或参数非法返回 422。"
     ),
     version=__version__,
     lifespan=lifespan,
@@ -648,3 +654,39 @@ def get_alert_custody(sample_id: str, conn=Depends(services.get_db_connection)):
 
     _require_sample(conn, sample_id)
     return services.alert_custody(conn, sample_id)
+
+
+# ---------------- 只读配液方案 ----------------
+
+
+@app.post(
+    "/solution-plans",
+    response_model=SolutionPlanResponse,
+    tags=["solution-plans"],
+)
+def create_solution_plan(
+    payload: SolutionPlanRequest,
+    conn=Depends(services.get_db_connection),
+):
+    """只读配液方案：精确枚举，不扣减任何库存。
+
+    给定 1～6 个**已存在**来源样本（请求中各自给出整数浓度 ng/µL 与可用体积 µL）
+    与目标体积（1～30 µL）/目标浓度（0～100 ng/µL），求整数取用体积 ``x_i``：
+
+    * ``0 ≤ x_i ≤ 可用体积``；
+    * ``Σ x_i = 目标体积``；
+    * ``Σ x_i × 来源浓度 = 目标体积 × 目标浓度``（精确相等，无四舍五入、无贪心近似）。
+
+    先按**使用来源样本数最少**、再按请求顺序的取用体积向量**字典序最小**择优，
+    逐项返回配方（含零用量项）与使用样本数。无精确解返回 409；
+    样本不存在、来源 ID 重复或参数（范围/类型/个数）非法返回 422。
+    接口为纯只读计算：不读取库存字段、不修改任何数据。
+    """
+
+    try:
+        result = services.plan_solution(conn, payload.model_dump())
+    except services.ValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    if result is None:
+        raise HTTPException(status_code=409, detail="不存在满足目标体积与浓度的精确配液方案")
+    return result
