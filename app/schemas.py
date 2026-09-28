@@ -208,6 +208,90 @@ class AlertCustodyItem(BaseModel):
     )
 
 
+# ---------------- 只读配液方案 ----------------
+
+
+class PreparationSourceIn(BaseModel):
+    """配液候选来源：关联已有样本，并给出该样本当前浓度与可用体积。
+
+    体积/浓度仅用于本次方案计算，接口只读，不扣减、不持久化任何库存。
+    """
+
+    sample_id: str = Field(
+        ...,
+        min_length=1,
+        max_length=128,
+        description="已有样本 ID（samples.id）；请求内不得重复",
+    )
+    concentration_ng_ul: int = Field(
+        ...,
+        strict=True,
+        ge=0,
+        le=100,
+        description="来源样本浓度（整数纳克/微升，0~100）",
+    )
+    available_volume_ul: int = Field(
+        ...,
+        strict=True,
+        ge=0,
+        le=30,
+        description="来源样本可用体积（整数微升，0~30）",
+    )
+
+
+class PreparationPlanRequest(BaseModel):
+    sources: list[PreparationSourceIn] = Field(
+        ...,
+        min_length=1,
+        max_length=6,
+        description="1~6 个不同来源样本（按请求顺序决定字典序）",
+    )
+    target_volume_ul: int = Field(
+        ...,
+        strict=True,
+        ge=1,
+        le=30,
+        description="目标混合液体积（整数微升，1~30）",
+    )
+    target_concentration_ng_ul: int = Field(
+        ...,
+        strict=True,
+        ge=0,
+        le=100,
+        description="目标浓度（整数纳克/微升，0~100）",
+    )
+
+    @model_validator(mode="after")
+    def _validate_unique_ids(self):
+        ids = [s.sample_id for s in self.sources]
+        if len(set(ids)) != len(ids):
+            raise ValueError("sources 中的 sample_id 不得重复")
+        return self
+
+
+class PreparationPlanItemOut(BaseModel):
+    """单个来源的逐项配方（未使用的来源同样返回，volume_ul 为 0）。"""
+
+    sample_id: str
+    sample_name: str
+    order_index: int = Field(..., description="该来源在请求中的序号（0 起）")
+    concentration_ng_ul: int
+    available_volume_ul: int
+    volume_ul: int = Field(..., description="取用体积（整数微升，0 表示不使用该来源）")
+    used: bool = Field(..., description="volume_ul 是否大于 0")
+
+
+class PreparationPlanOut(BaseModel):
+    target_volume_ul: int
+    target_concentration_ng_ul: int
+    target_mass_ng: int = Field(..., description="目标总质量 = 目标体积 × 目标浓度（纳克）")
+    used_sample_count: int = Field(..., description="非零用量的来源样本数")
+    items: list[PreparationPlanItemOut] = Field(
+        ...,
+        description="逐项配方，与请求 sources 等长、同序，含零用量来源",
+    )
+
+
 # ---------------- 响应模型 ----------------
 
 

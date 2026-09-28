@@ -35,6 +35,8 @@ from .schemas import (
     RecomputeResponse,
     ReadingIn,
     ReadingsBatch,
+    PreparationPlanOut,
+    PreparationPlanRequest,
     SampleCreate,
     SampleOut,
     SampleStateOut,
@@ -65,6 +67,9 @@ app = FastAPI(
         "支持样本告警保管责任归属：按生效时间登记保管人交接（允许补录，同时刻仅一条），"
         "相邻交接形成左闭右开责任区间；告警归责查询按当前告警事件时间匹配区间、"
         "查询时即时计算不持久化，补录交接或告警重算后即反映最新结果。"
+        "另提供只读配液方案：关联 1~6 个既有样本，按请求给出的浓度与可用体积穷举"
+        "满足目标体积/浓度的精确整数微升配方（最少来源数优先，再按请求顺序取"
+        "取用体积向量字典序最小），不扣减库存、不写入数据；无精确解返回 409。"
     ),
     version=__version__,
     lifespan=lifespan,
@@ -648,3 +653,39 @@ def get_alert_custody(sample_id: str, conn=Depends(services.get_db_connection)):
 
     _require_sample(conn, sample_id)
     return services.alert_custody(conn, sample_id)
+
+
+# ---------------- 只读配液方案 ----------------
+
+
+@app.post(
+    "/preparation-plans",
+    response_model=PreparationPlanOut,
+    tags=["preparation"],
+)
+def create_preparation_plan(
+    payload: PreparationPlanRequest,
+    conn=Depends(services.get_db_connection),
+):
+    """只读配液方案：关联已有样本搜索精确整数微升配方，不扣减库存。
+
+    对 1~6 个**不同**的既有样本，各取不超过其可用体积的整数微升，
+    使取用体积之和恰好等于目标体积、取用体积×浓度之和恰好等于
+    目标体积×目标浓度（整数算术，精确成立，不做四舍五入或贪心近似）。
+    在所有可行方案中先取**非零用量来源数最少**者，来源数相同时按
+    **请求顺序**组成的取用体积向量取**字典序最小**者。
+    响应逐项返回全部来源（含零用量）与使用样本数；无精确解返回 409，
+    样本不存在、ID 重复或参数非法返回 422。本接口不写入任何数据。
+    """
+
+    try:
+        return services.solve_preparation_plan(
+            conn,
+            [s.model_dump() for s in payload.sources],
+            payload.target_volume_ul,
+            payload.target_concentration_ng_ul,
+        )
+    except services.PreparationValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except services.NoExactSolutionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))

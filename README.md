@@ -25,6 +25,11 @@
   告警归责查询按当前告警的事件时间匹配责任区间（恰在交接时刻归新保管人），
   返回告警 ID、事件时间、保管人与交接 ID；归责在查询时即时计算、**不持久化**，
   补录交接或迟到读数引起告警重算后查询即反映最新结果，既有告警确认语义不变；
+- 提供**只读配液方案**：关联 1～6 个**已有样本**，按请求给出的整数浓度
+  （0～100 ng/μL）与可用体积（0～30 μL），穷举各取**整数微升**且精确满足
+  目标体积（1～30 μL）与目标浓度的配方——先最少使用来源样本数，
+  再按请求顺序取取用体积向量字典序最小者；**精确整数算术，不四舍五入、不贪心近似**，
+  逐项返回含零用量的配方与使用样本数，无精确解返回 409；**只读，不扣减库存、不写数据**；
 - 容器启动即自动初始化数据库（建表、索引），旧版本数据库自动兼容迁移。
 
 ## 目录结构
@@ -34,10 +39,11 @@ app/
   main.py        # FastAPI 路由与启动初始化
   engine.py      # 纯函数冻融状态机（循环识别 + 告警推导），不依赖 Web/DB
   matching.py    # 纯函数一致性配对（不交叉一对一最优配对），不依赖 Web/DB
+  planning.py    # 纯函数只读配液方案精确求解（最少来源数 + 字典序），不依赖 Web/DB
   database.py    # SQLite 连接与幂等建表脚本
   schemas.py     # Pydantic 请求/响应模型
-  services.py    # 业务层：幂等写入、时间重排重算、告警确认、一致性核查
-tests/           # pytest：引擎/配对单元测试 + API 集成测试
+  services.py    # 业务层：幂等写入、时间重排重算、告警确认、一致性核查、配液方案
+tests/           # pytest：引擎/配对/配液单元测试 + API 集成测试
 examples/        # requests.http / demo.sh 示例请求
 Dockerfile
 docker-compose.yml
@@ -269,6 +275,71 @@ curl http://localhost:8000/samples/sample-demo-001/custody-handovers
 curl http://localhost:8000/samples/sample-demo-001/alert-custody
 ```
 
+## 只读配液方案
+
+`POST /preparation-plans` 关联 1～6 个**已有样本**，根据请求逐项给出的来源浓度与
+可用体积，计算一份**精确整数微升**的混合液配方（只查询、不扣减库存、不写入任何数据）：
+
+- 体积单位均为整数微升：目标体积 `target_volume_ul` 取 **1～30**；
+  每个来源 `available_volume_ul` 取 **0～30**；
+- 浓度单位均为整数纳克/微升：来源 `concentration_ng_ul` 与目标
+  `target_concentration_ng_ul` 均取 **0～100**（必须是整数，小数 / 布尔值按 422 拒绝）；
+- 来源样本必须已存在，请求内 `sample_id` **不得重复**（1～6 个不同 ID）；
+- 每个来源取用体积为整数微升且 `0 <= volume <= available_volume_ul`；
+  方案必须**精确**满足（整数算术，不做四舍五入或贪心近似）：
+
+  ```
+  Σ volume_i                       = target_volume_ul
+  Σ volume_i × concentration_i     = target_volume_ul × target_concentration_ng_ul
+  ```
+
+- 搜索**所有**可行方案后按字典序择优：
+  1. **非零用量的来源样本数最少**；
+  2. 来源数相同时，按**请求顺序**组成的取用体积向量取**字典序最小**者。
+- 响应 `items` 与请求 `sources` **等长、同序**逐项返回（未使用的来源也返回，
+  `volume_ul=0`、`used=false`），并给出 `used_sample_count`；
+  **不存在精确整数解时返回 409**；样本不存在、ID 重复或参数非法返回 **422**。
+
+示例：用 20/80/40/60 ng/μL 四个来源配 10 μL、50 ng/μL（目标总质量 500 ng）。
+同为两来源可行时，请求顺序上的体积向量 `[0,0,5,5]`（40+60）比 `[5,5,0,0]`
+（20+80）字典序更小；若存在单来源 50 ng/μL 的方案，则只选该来源：
+
+```bash
+curl -X POST http://localhost:8000/preparation-plans \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "sources": [
+      {"sample_id": "sample-demo-001", "concentration_ng_ul": 20, "available_volume_ul": 30},
+      {"sample_id": "sample-demo-002", "concentration_ng_ul": 80, "available_volume_ul": 30},
+      {"sample_id": "sample-demo-003", "concentration_ng_ul": 40, "available_volume_ul": 30},
+      {"sample_id": "sample-demo-004", "concentration_ng_ul": 60, "available_volume_ul": 30}
+    ],
+    "target_volume_ul": 10,
+    "target_concentration_ng_ul": 50
+  }'
+```
+
+响应（逐项含零用量；`5×40 + 5×60 = 500 ng = 10×50`，精确成立）：
+
+```json
+{
+  "target_volume_ul": 10,
+  "target_concentration_ng_ul": 50,
+  "target_mass_ng": 500,
+  "used_sample_count": 2,
+  "items": [
+    {"sample_id": "sample-demo-001", "sample_name": "样本 1", "order_index": 0, "concentration_ng_ul": 20, "available_volume_ul": 30, "volume_ul": 0, "used": false},
+    {"sample_id": "sample-demo-002", "sample_name": "样本 2", "order_index": 1, "concentration_ng_ul": 80, "available_volume_ul": 30, "volume_ul": 0, "used": false},
+    {"sample_id": "sample-demo-003", "sample_name": "样本 3", "order_index": 2, "concentration_ng_ul": 40, "available_volume_ul": 30, "volume_ul": 5, "used": true},
+    {"sample_id": "sample-demo-004", "sample_name": "样本 4", "order_index": 3, "concentration_ng_ul": 60, "available_volume_ul": 30, "volume_ul": 5, "used": true}
+  ]
+}
+```
+
+无精确整数解的情形（例如 3 μL 配 50 ng/μL，仅 40 / 60 ng/μL 来源时
+需要 1.5 μL）返回 **409**；浓度、体积仅用于本次计算，
+接口不落库、不扣减任何库存，重复查询结果一致。
+
 ## 幂等去重
 
 - 提供 `event_id` 时：`(sample_id, event_id)` 唯一，重复提交直接跳过；
@@ -299,6 +370,7 @@ curl http://localhost:8000/samples/sample-demo-001/alert-custody
 | GET | `/samples/{id}/logger-consistency/{logger_id}?max_time_diff_seconds=...&temp_diff_threshold_c=...` | **温度一致性核查**：直接读数与当前归属记录仪读数不交叉一对一最优配对，返回温差超限配对明细与配对/未配对数量（只读） |
 | POST/GET | `/samples/{id}/custody-handovers` | 登记保管人交接（按生效时间，允许补录较早交接；同时刻仅一条，重复 409）/ 交接记录列表（按生效时间升序） |
 | GET | `/samples/{id}/alert-custody` | **告警归责查询**：当前告警按事件时间匹配左闭右开责任区间（恰在交接时刻归新保管人，首条之前责任人为空），返回告警 ID、事件时间、保管人与交接 ID；查询时即时计算、不持久化 |
+| POST | `/preparation-plans` | **只读配液方案**：1～6 个不同已有样本 + 目标体积（1～30 μL）/浓度（0～100 ng/μL），穷举精确整数微升配方，先最少来源数、再按请求顺序取体积向量字典序最小，逐项（含零用量）返回；不扣库存，无精确解 409，样本不存在/重复 ID/参数非法 422 |
 | GET | `/samples/{id}/state` | **当前状态**、循环次数、双向暴露剂量/缺口/预算使用率、未确认告警数、最近读数 |
 | GET | `/samples/{id}/cycles` | **完整冻融循环明细** |
 | POST | `/samples/{id}/recompute` | 手动重算 |
@@ -471,4 +543,8 @@ pytest -q
 保管责任归属部分覆盖交接登记与补录排序、同时刻重复登记 409、时区归一化与参数校验、
 左闭右开责任区间匹配（恰在交接时刻归新保管人、首条之前责任人为空）、
 补录交接与迟到读数/配置变更重算后归责查询即时反映最新结果且不残留过期归责、
-既有告警确认语义保留、删除样本级联清理交接记录。
+既有告警确认语义保留、删除样本级联清理交接记录；
+配液方案部分覆盖精确整数解、可用体积上限约束、无整数解不四舍五入返回 409、
+最少来源数优先于字典序、同来源数下按请求顺序字典序最小、零浓度/零可用量边界、
+逐项含零用量返回、样本不存在 422、重复 ID 422、参数范围与非整数/布尔值严格 422、
+只读不修改样本且可重复查询。

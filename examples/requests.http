@@ -159,3 +159,44 @@ GET {{baseUrl}}/samples/{{sampleId}}/custody-handovers
 
 ### 23. 告警归责查询（当前告警按事件时间匹配左闭右开责任区间；查询时计算，不持久化）
 GET {{baseUrl}}/samples/{{sampleId}}/alert-custody
+
+### 24. 只读配液方案：关联 4 个已有样本，配 10 μL、50 ng/μL（精确整数解；只读不扣库存）
+###     同为两来源时 [0,0,5,5]（40+60）比 [5,5,0,0]（20+80）字典序更小
+POST {{baseUrl}}/preparation-plans
+Content-Type: application/json
+
+{
+  "sources": [
+    {"sample_id": "{{sampleId}}", "concentration_ng_ul": 20, "available_volume_ul": 30},
+    {"sample_id": "sample-demo-002", "concentration_ng_ul": 80, "available_volume_ul": 30},
+    {"sample_id": "sample-demo-003", "concentration_ng_ul": 40, "available_volume_ul": 30},
+    {"sample_id": "sample-demo-004", "concentration_ng_ul": 60, "available_volume_ul": 30}
+  ],
+  "target_volume_ul": 10,
+  "target_concentration_ng_ul": 50
+}
+
+### 25. 无精确整数解（3 μL 配 50 ng/μL，仅 40/60 来源 → 需 1.5 μL）→ 409
+POST {{baseUrl}}/preparation-plans
+Content-Type: application/json
+
+{
+  "sources": [
+    {"sample_id": "sample-demo-003", "concentration_ng_ul": 40, "available_volume_ul": 30},
+    {"sample_id": "sample-demo-004", "concentration_ng_ul": 60, "available_volume_ul": 30}
+  ],
+  "target_volume_ul": 3,
+  "target_concentration_ng_ul": 50
+}
+
+### 26. 引用不存在的样本 → 422
+POST {{baseUrl}}/preparation-plans
+Content-Type: application/json
+
+{
+  "sources": [
+    {"sample_id": "no-such-sample", "concentration_ng_ul": 50, "available_volume_ul": 10}
+  ],
+  "target_volume_ul": 10,
+  "target_concentration_ng_ul": 50
+}

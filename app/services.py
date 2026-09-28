@@ -15,6 +15,11 @@
 保管人交接（``custody_handovers``）：按生效时间登记（允许补录较早交接，
 同一样本同一时刻仅一条），相邻交接形成左闭右开责任区间，首条之前责任人为空。
 告警归责在查询时按当前告警事件时间即时匹配，不持久化过期归责。
+
+只读配液方案（``planning`` 纯函数求解）：引用既有样本，按请求给出的浓度与
+可用体积穷举满足目标体积 / 目标浓度的**精确整数微升**方案
+（最少来源数优先，再按请求顺序取用量向量字典序最小），
+不扣减库存、不写入任何数据；无精确解返回 409。
 """
 
 from __future__ import annotations
@@ -25,7 +30,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-from . import engine, matching
+from . import engine, matching, planning
 from .database import connect
 
 # SQLite 单文件写入需要串行化；批量提交 + 重算整体持锁。
@@ -1344,6 +1349,77 @@ def alert_custody(conn: sqlite3.Connection, sample_id: str) -> list[dict]:
                 }
             )
     return items
+
+
+# ---------------- 只读配液方案 ----------------
+
+
+class PreparationValidationError(Exception):
+    """配液请求业务校验失败（引用样本不存在等），路由层映射为 422。"""
+
+
+class NoExactSolutionError(Exception):
+    """不存在精确整数配液方案，路由层映射为 409。"""
+
+
+def solve_preparation_plan(
+    conn: sqlite3.Connection,
+    sources: list[dict],
+    target_volume_ul: int,
+    target_concentration_ng_ul: int,
+) -> dict:
+    """为既有样本搜索精确整数配液方案（**只读**：不扣减库存、不写任何数据）。
+
+    浓度 / 可用体积由请求按来源逐项给出，仅用于本次计算；样本必须已存在
+    （否则抛 ``PreparationValidationError`` → 422；ID 重复与数值范围由
+    Pydantic 校验，同样 422）。不存在精确整数方案时抛
+    ``NoExactSolutionError`` → 409（不做四舍五入或贪心近似）。
+    """
+
+    plan_sources: list[planning.PlanSource] = []
+    names: dict[str, str] = {}
+    for idx, s in enumerate(sources):
+        sample_id = s["sample_id"]
+        sample = get_sample(conn, sample_id)
+        if sample is None:
+            raise PreparationValidationError(f"样本不存在：{sample_id}")
+        names[sample_id] = sample["name"]
+        plan_sources.append(
+            planning.PlanSource(
+                index=idx,
+                sample_id=sample_id,
+                concentration_ng_ul=s["concentration_ng_ul"],
+                available_volume_ul=s["available_volume_ul"],
+            )
+        )
+
+    solution = planning.solve(
+        plan_sources, target_volume_ul, target_concentration_ng_ul
+    )
+    if solution is None:
+        raise NoExactSolutionError(
+            "不存在满足体积与浓度精确约束的整数微升配液方案"
+        )
+
+    items = [
+        {
+            "sample_id": src.sample_id,
+            "sample_name": names[src.sample_id],
+            "order_index": src.index,
+            "concentration_ng_ul": src.concentration_ng_ul,
+            "available_volume_ul": src.available_volume_ul,
+            "volume_ul": volume,
+            "used": volume > 0,
+        }
+        for src, volume in zip(plan_sources, solution.volumes)
+    ]
+    return {
+        "target_volume_ul": target_volume_ul,
+        "target_concentration_ng_ul": target_concentration_ng_ul,
+        "target_mass_ng": target_volume_ul * target_concentration_ng_ul,
+        "used_sample_count": solution.used_count,
+        "items": items,
+    }
 
 
 def get_db_connection() -> sqlite3.Connection:

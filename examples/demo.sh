@@ -114,3 +114,37 @@ curl -sS "$BASE/samples/$SID/custody-handovers"; echo
 
 echo "== 告警归责查询（当前告警按事件时间匹配左闭右开责任区间）=="
 curl -sS "$BASE/samples/$SID/alert-custody"; echo
+
+echo "== 只读配液方案：登记 3 个配液来源样本（已存在则跳过）=="
+for pair in "sample-demo-002:80ng 原液 A" "sample-demo-003:40ng 原液 B" "sample-demo-004:60ng 原液 C"; do
+  pid="${pair%%:*}"; pname="${pair#*:}"
+  curl -sS "$BASE/samples/$pid" | grep -q "\"id\"" || \
+    curl -sS -X POST "$BASE/samples" -H 'Content-Type: application/json' -d "{
+      \"id\": \"$pid\", \"name\": \"$pname\",
+      \"freeze_threshold_c\": -20, \"thaw_threshold_c\": 0
+    }"
+done; echo
+
+echo "== 配 10 μL、50 ng/μL：[0,0,5,5]（40+60）字典序小于 [5,5,0,0]（20+80），逐项含零用量 =="
+curl -sS -X POST "$BASE/preparation-plans" -H 'Content-Type: application/json' -d "{
+  \"sources\": [
+    {\"sample_id\": \"$SID\", \"concentration_ng_ul\": 20, \"available_volume_ul\": 30},
+    {\"sample_id\": \"sample-demo-002\", \"concentration_ng_ul\": 80, \"available_volume_ul\": 30},
+    {\"sample_id\": \"sample-demo-003\", \"concentration_ng_ul\": 40, \"available_volume_ul\": 30},
+    {\"sample_id\": \"sample-demo-004\", \"concentration_ng_ul\": 60, \"available_volume_ul\": 30}
+  ],
+  \"target_volume_ul\": 10,
+  \"target_concentration_ng_ul\": 50
+}"; echo
+
+echo "== 无精确整数解（3 μL 配 50 ng/μL，仅 40/60 来源）→ HTTP 409（不四舍五入）=="
+curl -sS -o /tmp/prep_409.json -w "HTTP %{http_code}\n" -X POST "$BASE/preparation-plans" \
+  -H 'Content-Type: application/json' -d '{
+  "sources": [
+    {"sample_id": "sample-demo-003", "concentration_ng_ul": 40, "available_volume_ul": 30},
+    {"sample_id": "sample-demo-004", "concentration_ng_ul": 60, "available_volume_ul": 30}
+  ],
+  "target_volume_ul": 3,
+  "target_concentration_ng_ul": 50
+}'
+cat /tmp/prep_409.json; echo
